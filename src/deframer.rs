@@ -71,6 +71,15 @@ impl Deframer {
         self.stats
     }
 
+    /// Discards every byte held in the buffer, each counted in [`Stats::garbage_bytes`]. All other
+    /// counters are left as they are, and the deframer then behaves like a new one.
+    ///
+    /// For the caller that changed the UART's baud rate: bytes received before the change must not be
+    /// joined with bytes received after it.
+    pub fn clear(&mut self) {
+        self.discard(self.len);
+    }
+
     /// Feeds `bytes` in any chunking, down to one byte per call. `on_frame` is called once per
     /// accepted frame, in stream order, before the next byte is looked at.
     ///

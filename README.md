@@ -29,6 +29,7 @@ impl Deframer {
     pub const fn new() -> Self;
     pub fn push<F: FnMut(Frame<'_>)>(&mut self, bytes: &[u8], on_frame: F);
     pub const fn stats(&self) -> Stats;
+    pub fn clear(&mut self); // drops the buffered bytes (counted as garbage), e.g. after a baud rate change
 }
 pub enum Frame<'a> { // non_exhaustive
     RcChannels(RcChannels),            // raw: [u16; 16]

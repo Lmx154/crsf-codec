@@ -787,3 +787,147 @@ mod differential {
         }
     }
 }
+
+// ---------------------------------------------------------------- clear
+
+fn rc_frame() -> Vec<u8> {
+    frame(0x16, &pack(&[992; 16]))
+}
+
+#[test]
+fn clear_drops_a_partial_frame_and_the_next_frame_comes_out_clean() {
+    let whole = rc_frame();
+    let mut d = Deframer::new();
+    let mut out = Vec::new();
+    d.push(&whole[..10], |f| out.push(own(f)));
+    assert_eq!(d.buffered(), 10);
+    d.clear();
+    assert_eq!(d.buffered(), 0);
+    d.push(&whole, |f| out.push(own(f)));
+    assert_eq!(out.len(), 1);
+    assert!(matches!(out[0], Owned::Rc(_)));
+    let s = d.stats();
+    assert_eq!(s.garbage_bytes, 10);
+    assert_eq!(s.frames, 1);
+    assert_eq!(s.crc_errors, 0);
+    assert_eq!(s.bad_length, 0);
+    assert_eq!(d.buffered(), 0);
+}
+
+#[test]
+fn clear_negative_control_without_clear_the_partial_bytes_cause_a_crc_error() {
+    let whole = rc_frame();
+    let mut d = Deframer::new();
+    let mut out = Vec::new();
+    d.push(&whole[..10], |f| out.push(own(f)));
+    d.push(&whole, |f| out.push(own(f)));
+    // The stale candidate (26 bytes announced) is judged on 10 old and 16 new bytes: CRC error.
+    let s = d.stats();
+    assert_eq!(s.crc_errors, 1);
+    // The real frame is still found behind it, but only after the stale candidate was rejected.
+    assert_eq!(out.len(), 1);
+    assert_eq!(s.frames, 1);
+    // Same accounting of garbage here, but it is reached through a CRC error that clear() avoids.
+    assert_eq!(s.garbage_bytes, 10);
+    assert_ne!(s, {
+        let mut c = Deframer::new();
+        c.push(&whole[..10], |_| {});
+        c.clear();
+        c.push(&whole, |_| {});
+        c.stats()
+    });
+}
+
+#[test]
+fn clear_negative_control_a_longer_partial_delays_the_frame() {
+    // A candidate announcing 62 (the maximum) swallows the next frame's bytes until 64 have arrived.
+    let whole = rc_frame();
+    let partial = [0xC8, 62, 0x30, 0, 0];
+    let mut without = Deframer::new();
+    let mut n_without = 0;
+    without.push(&partial, |_| n_without += 1);
+    without.push(&whole[..20], |_| n_without += 1);
+    assert_eq!(n_without, 0);
+    without.push(&whole[20..], |_| n_without += 1);
+    // 5 + 26 = 31 < 64 bytes: the real frame has fully arrived and is still held back.
+    assert_eq!(n_without, 0);
+    assert_eq!(without.buffered(), 31);
+
+    let mut with = Deframer::new();
+    let mut n_with = 0;
+    with.push(&partial, |_| n_with += 1);
+    with.clear();
+    with.push(&whole, |_| n_with += 1);
+    assert_eq!(n_with, 1);
+    assert_eq!(with.buffered(), 0);
+}
+
+#[test]
+fn clear_on_an_empty_deframer_changes_nothing() {
+    let mut d = Deframer::new();
+    d.clear();
+    assert_eq!(d.stats(), Stats::default());
+    assert_eq!(d.buffered(), 0);
+
+    let mut d = Deframer::new();
+    d.push(&rc_frame(), |_| {});
+    d.push(&[1, 2, 0xC8, 0xFF], |_| {});
+    // 0xC8 0xFF is a bad length: both bytes are garbage, the buffer is empty.
+    assert_eq!(d.buffered(), 0);
+    let before = d.stats();
+    d.clear();
+    assert_eq!(d.stats(), before);
+    assert_eq!(d.buffered(), 0);
+}
+
+#[test]
+fn clear_counts_every_byte_and_saturates() {
+    let mut d = Deframer::new();
+    d.push(&[0xC8, 62, 1, 2], |_| {});
+    assert_eq!(d.buffered(), 4);
+    d.clear();
+    assert_eq!(d.stats().garbage_bytes, 4);
+    assert_eq!(d.stats().frames, 0);
+
+    let mut near_full = d.stats();
+    near_full.garbage_bytes = u32::MAX - 1;
+    d.set_stats(near_full);
+    d.push(&[0xC8, 62, 1, 2], |_| {});
+    d.clear();
+    assert_eq!(d.stats().garbage_bytes, u32::MAX);
+}
+
+proptest! {
+    #[test]
+    fn clear_at_random_points_keeps_the_accounting_and_equals_fresh_deframers(
+        stream in mixed_stream(),
+        cuts in proptest::collection::vec(any::<usize>(), 0..8),
+    ) {
+        let mut points: Vec<usize> = cuts.iter().map(|c| c % (stream.len() + 1)).collect();
+        points.push(0);
+        points.push(stream.len());
+        points.sort_unstable();
+
+        let mut d = Deframer::new();
+        let mut got: Vec<Owned> = Vec::new();
+        let mut expected: Vec<Owned> = Vec::new();
+        let mut accepted = 0usize;
+        for w in points.windows(2) {
+            let segment = &stream[w[0]..w[1]];
+            d.push(segment, |f| {
+                let o = own(f);
+                accepted += wire_len(&o);
+                got.push(o);
+            });
+            prop_assert!(d.buffered() <= MAX_FRAME_LEN);
+            d.clear();
+            prop_assert_eq!(d.buffered(), 0);
+            let (frames, _, _) = run_whole(segment);
+            expected.extend(frames);
+        }
+        prop_assert_eq!(&got, &expected);
+        let s = d.stats();
+        prop_assert_eq!(stream.len(), accepted + s.garbage_bytes as usize + d.buffered());
+        prop_assert_eq!(s.frames as usize, got.len());
+    }
+}
