@@ -1,0 +1,23 @@
+[package]
+name = "crsf-codec"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "CRSF codec for a flight controller that listens to an ExpressLRS receiver: sans-IO deframer, RC channels and link statistics decoders, battery sensor encoder."
+readme = "README.md"
+keywords = ["embedded", "no-std", "crsf", "expresslrs", "rc"]
+categories = ["embedded", "no-std", "encoding"]
+rust-version = "1.99"
+
+[features]
+defmt = ["dep:defmt"]
+
+[dependencies]
+defmt = { version = "1.0.1", optional = true }
+
+[workspace]
+
+[dev-dependencies]
+proptest = "1.12"
+uf-crsf = "=0.7.0"
