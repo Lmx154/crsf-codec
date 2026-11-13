@@ -2,7 +2,7 @@
 
 CRSF codec for the MARV V2 flight controller, which listens to an ExpressLRS receiver on a UART. The crate is `no_std`, has no dependencies (except an optional `defmt` 1.x behind the feature `defmt`) and does no I/O: bytes in, validated frames out. It reads RC channels and link statistics, passes every other frame type through as raw bytes, and writes one frame, the battery sensor. It has no time, no allocation, no statics and no `unsafe`, and it uses integer arithmetic only. It never panics on any input.
 
-**Status: version 0.1.0 (`publish = false`). The API may still change. It is tested on the host only. Nothing has been run against a real receiver yet;** frames captured from a receiver will be added as test vectors later.
+**Status: version 0.1.0 (`publish = false`). The API may still change. It is tested on the host, and on 2026-11-13, through `rc-port` on the MARV V2 Rev 1 board, it decoded the CRSF of a real ExpressLRS 4.0.1 receiver at 420000 baud: about 246 RC frames and 10 link-statistics frames per second for several minutes, with 0 CRC errors in CRSF mode. Its battery frame was shown by the handset as sent (12.3 V, 0.0 A, 0 mAh, 50 %).** Frames captured from the receiver have not yet been added as test vectors; that is still planned.
 
 ## Works with
 
