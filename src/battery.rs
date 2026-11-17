@@ -23,17 +23,19 @@ pub struct Battery {
     pub remaining_percent: u8,
 }
 
-/// Why [`encode_battery`] refused.
+/// Why [`encode_battery`] or [`encode_gps`](crate::encode_gps) refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum EncodeError {
-    /// The output buffer is shorter than [`BATTERY_FRAME_LEN`].
+    /// The output buffer is shorter than the frame ([`BATTERY_FRAME_LEN`], [`GPS_FRAME_LEN`](crate::GPS_FRAME_LEN)).
     BufferTooSmall,
     /// `capacity_used_mah` is above [`MAX_CAPACITY_MAH`].
     CapacityOutOfRange,
     /// `remaining_percent` is above 100.
     PercentOutOfRange,
+    /// `altitude_m` of [`encode_gps`](crate::encode_gps) is outside -1000 to 64 535.
+    AltitudeOutOfRange,
 }
 
 /// Writes a battery sensor frame into the start of `out` and returns its length,

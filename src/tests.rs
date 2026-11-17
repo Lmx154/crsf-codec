@@ -2,8 +2,9 @@
 
 use crate::crc::crc8;
 use crate::{
-    BATTERY_FRAME_LEN, Battery, Deframer, EncodeError, Frame, LinkStatistics, MAX_CAPACITY_MAH,
-    MAX_FRAME_LEN, RcChannels, Stats, encode_battery, raw_to_us,
+    BATTERY_FRAME_LEN, Battery, Deframer, EncodeError, Frame, GPS_FRAME_LEN, Gps, LinkStatistics,
+    MAX_ALTITUDE_M, MAX_CAPACITY_MAH, MAX_FRAME_LEN, MIN_ALTITUDE_M, RcChannels, Stats,
+    encode_battery, encode_gps, raw_to_us,
 };
 use proptest::prelude::*;
 use std::vec::Vec;
@@ -712,6 +713,119 @@ fn battery_limits_and_errors() {
     assert_eq!(encode_battery(&ok, &mut out[..12]), Ok(12));
 }
 
+// ---------------------------------------------------------------- GPS encoder
+
+fn gps_golden() -> Gps {
+    Gps {
+        latitude_e7: 450_000_000,
+        longitude_e7: 90_000_000,
+        groundspeed_dkmh: 360,
+        heading_cdeg: 9000,
+        altitude_m: 120,
+        satellites: 9,
+    }
+}
+
+#[test]
+fn gps_hand_vector() {
+    // Made-up position: latitude 45.0000000 deg, longitude 9.0000000 deg. Derived by hand from the
+    // Betaflight (betaflight-telemetry-crsf.c:276-287) and ArduPilot (ardupilot-AP_CRSF_Telem.cpp:1111-1126)
+    // layouts, all big-endian:
+    //   address 0xC8; length 17 = type + 15 payload + CRC = 0x11; type 0x02
+    //   latitude   450 000 000 (i32) = 0x1AD27480 -> 1A D2 74 80
+    //   longitude   90 000 000 (i32) = 0x055D4A80 -> 05 5D 4A 80
+    //   groundspeed 36.0 km/h = 360 x 0.1 km/h (u16) = 0x0168 -> 01 68
+    //   heading     90.00 deg = 9000 x 0.01 deg (u16) = 0x2328 -> 23 28
+    //   altitude    120 m + 1000 = 1120 (u16) = 0x0460 -> 04 60
+    //   satellites  9 -> 09
+    //   CRC-8 (0xD5) over type and payload = 0xF9
+    let mut out = [0xAAu8; 64];
+    let n = encode_gps(&gps_golden(), &mut out).unwrap();
+    assert_eq!(n, GPS_FRAME_LEN);
+    assert_eq!(
+        &out[..n],
+        &[
+            0xC8, 0x11, 0x02, 0x1A, 0xD2, 0x74, 0x80, 0x05, 0x5D, 0x4A, 0x80, 0x01, 0x68, 0x23,
+            0x28, 0x04, 0x60, 0x09, 0xF9
+        ]
+    );
+    assert_eq!(out[n - 1], crc8(&out[2..n - 1]));
+    assert!(out[n..].iter().all(|&b| b == 0xAA), "wrote past the frame");
+    // The crate has no GPS decoder: the deframer accepts the frame (length and CRC) as an other frame.
+    let (frames, stats, _) = run_whole(&out[..n]);
+    assert_eq!(frames, [Owned::Other(0x02, out[3..n - 1].to_vec())]);
+    assert_eq!((stats.frames, stats.other_frames), (1, 1));
+    assert_eq!(
+        (stats.crc_errors, stats.bad_length, stats.garbage_bytes),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn gps_negative_and_extreme_values() {
+    // Latitude -45.0000000 = -450 000 000 = 0xE52D8B80, longitude -9.0000000 = -90 000 000 = 0xFAA2B580
+    // (two's complement), speed and heading 0xFFFF (written as given), altitude -1000 m = wire 0,
+    // 255 satellites; CRC-8 = 0xBE.
+    let gps = Gps {
+        latitude_e7: -450_000_000,
+        longitude_e7: -90_000_000,
+        groundspeed_dkmh: u16::MAX,
+        heading_cdeg: u16::MAX,
+        altitude_m: MIN_ALTITUDE_M,
+        satellites: 255,
+    };
+    let mut out = [0u8; GPS_FRAME_LEN];
+    assert_eq!(encode_gps(&gps, &mut out), Ok(GPS_FRAME_LEN));
+    assert_eq!(
+        out,
+        [
+            0xC8, 0x11, 0x02, 0xE5, 0x2D, 0x8B, 0x80, 0xFA, 0xA2, 0xB5, 0x80, 0xFF, 0xFF, 0xFF,
+            0xFF, 0x00, 0x00, 0xFF, 0xBE
+        ]
+    );
+}
+
+#[test]
+fn gps_altitude_limits_and_errors() {
+    let mut out = [0u8; 64];
+    let low = Gps {
+        altitude_m: -1000,
+        ..gps_golden()
+    };
+    assert_eq!(encode_gps(&low, &mut out), Ok(19));
+    assert_eq!(&out[15..17], &[0x00, 0x00]);
+    assert_eq!(out[18], crc8(&out[2..18]));
+    let high = Gps {
+        altitude_m: 64_535,
+        ..gps_golden()
+    };
+    assert_eq!(MAX_ALTITUDE_M, 64_535);
+    assert_eq!(encode_gps(&high, &mut out), Ok(19));
+    assert_eq!(&out[15..17], &[0xFF, 0xFF]);
+    assert_eq!(out[18], crc8(&out[2..18]));
+
+    for altitude_m in [-1001, 64_536, i32::MIN, i32::MAX] {
+        let mut untouched = [0x5Au8; 64];
+        let bad = Gps {
+            altitude_m,
+            ..gps_golden()
+        };
+        assert_eq!(
+            encode_gps(&bad, &mut untouched),
+            Err(EncodeError::AltitudeOutOfRange),
+            "{altitude_m}"
+        );
+        assert_eq!(untouched, [0x5A; 64]);
+    }
+    let ok = gps_golden();
+    assert_eq!(
+        encode_gps(&ok, &mut out[..18]),
+        Err(EncodeError::BufferTooSmall)
+    );
+    assert_eq!(encode_gps(&ok, &mut []), Err(EncodeError::BufferTooSmall));
+    assert_eq!(encode_gps(&ok, &mut out[..19]), Ok(19));
+}
+
 // ---------------------------------------------------------------- I5 differential against uf-crsf
 
 mod differential {
@@ -723,6 +837,31 @@ mod differential {
         let mut parser = CrsfParser::new();
         let mut input = bytes;
         parser.next_packet(&mut input).unwrap().unwrap()
+    }
+
+    #[test]
+    fn gps_frame_parses_in_uf_crsf_to_the_same_values() {
+        use uf_crsf::packets::Gps as UfGps;
+        let gps = gps_golden();
+        let mut out = [0u8; 64];
+        let n = encode_gps(&gps, &mut out).unwrap();
+        let Packet::Gps(theirs) = uf_parse(&out[..n]) else {
+            panic!("uf-crsf did not return a GPS packet");
+        };
+        assert_eq!(
+            theirs,
+            UfGps {
+                latitude: 450_000_000,
+                longitude: 90_000_000,
+                groundspeed: 360,
+                heading: 9000,
+                altitude: 1120,
+                satellites: 9,
+            }
+        );
+        let mut buf = [0u8; 64];
+        let m = write_packet_to_buffer(&mut buf, PacketAddress::FlightController, &theirs).unwrap();
+        assert_eq!(&buf[..m], &out[..n]);
     }
 
     proptest! {

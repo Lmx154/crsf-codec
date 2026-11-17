@@ -1,6 +1,6 @@
 # crsf-codec
 
-CRSF codec for the MARV V2 flight controller, which listens to an ExpressLRS receiver on a UART. The crate is `no_std`, has no dependencies (except an optional `defmt` 1.x behind the feature `defmt`) and does no I/O: bytes in, validated frames out. It reads RC channels and link statistics, passes every other frame type through as raw bytes, and writes one frame, the battery sensor. It has no time, no allocation, no statics and no `unsafe`, and it uses integer arithmetic only. It never panics on any input.
+CRSF codec for the MARV V2 flight controller, which listens to an ExpressLRS receiver on a UART. The crate is `no_std`, has no dependencies (except an optional `defmt` 1.x behind the feature `defmt`) and does no I/O: bytes in, validated frames out. It reads RC channels and link statistics, passes every other frame type through as raw bytes, and writes two frames, the battery sensor and GPS. It has no time, no allocation, no statics and no `unsafe`, and it uses integer arithmetic only. It never panics on any input.
 
 **Status: version 0.1.0 (`publish = false`). The API may still change. It is tested on the host, and on 2026-11-13, through `rc-port` on the MARV V2 Rev 1 board, it decoded the CRSF of a real ExpressLRS 4.0.1 receiver at 420000 baud: about 246 RC frames and 10 link-statistics frames per second for several minutes, with 0 CRC errors in CRSF mode. Its battery frame was shown by the handset as sent (12.3 V, 0.0 A, 0 mAh, 50 %).** Frames captured from the receiver have not yet been added as test vectors; that is still planned.
 
@@ -38,6 +38,7 @@ pub enum Frame<'a> { // non_exhaustive
 }
 pub const fn raw_to_us(v: u16) -> u16;
 pub fn encode_battery(battery: &Battery, out: &mut [u8]) -> Result<usize, EncodeError>;
+pub fn encode_gps(gps: &Gps, out: &mut [u8]) -> Result<usize, EncodeError>;
 ```
 
 `push` takes the bytes in any chunking, down to one byte per call, and calls `on_frame` once per accepted frame, in stream order. The result is the same however the stream is split. The frame borrows the deframer's buffer and is valid inside the call only.
@@ -70,6 +71,8 @@ assert_eq!(deframer.stats().garbage_bytes, 2);
 
 `encode_battery` writes a battery sensor frame (type 0x08, address 0xC8, 12 bytes) into the start of the caller's slice and returns 12. Payload: voltage `u16` big-endian in units of 0.1 V, current `u16` big-endian in units of 0.1 A, capacity used `u24` big-endian in mAh, remaining `u8` in percent. Out-of-range input is rejected, never saturated or truncated, and nothing is written on an error: a capacity above 16 777 215 mAh gives `EncodeError::CapacityOutOfRange`, a percent above 100 gives `EncodeError::PercentOutOfRange`, and a slice shorter than 12 bytes gives `EncodeError::BufferTooSmall`. Voltage and current take every `u16`.
 
+`encode_gps` writes a GPS frame (type 0x02, address 0xC8, 19 bytes, payload 15 bytes) into the start of the caller's slice and returns 19. Payload, all big-endian: latitude `i32` in units of 1e-7 degree (`latitude_e7`), longitude `i32` in units of 1e-7 degree (`longitude_e7`), ground speed `u16` in units of 0.1 km/h (`groundspeed_dkmh`), heading `u16` in units of 0.01 degree (`heading_cdeg`), altitude `u16` in metres plus 1000 (`altitude_m`, an `i32` from -1000 to 64 535), satellites in use `u8`. Latitude, longitude, speed, heading and satellites are written as given. Altitude is not clamped: a value the wire field cannot hold (outside -1000 to 64 535) gives `EncodeError::AltitudeOutOfRange` and nothing is written; a slice shorter than 19 bytes gives `EncodeError::BufferTooSmall`. Betaflight clamps the wire altitude to 0 to 5000 (metres plus 1000, so -1000 to 4000 m) and ArduPilot clamps the metres to 0 to 5000 before adding 1000, so a caller that wants either behaviour applies it before encoding. The layout follows both and agrees with `uf-crsf` 0.7.0; ground speed is 0.1 km/h per unit as in both flight stacks' code (a comment in the ArduPilot header says 0.01 km/h).
+
 ## Counters
 
 `Deframer::stats()` returns a `Stats` struct, all `u32`, all saturating:
@@ -82,11 +85,11 @@ assert_eq!(deframer.stats().garbage_bytes, 2);
 
 ## Deliberately not in the crate
 
-Subset RC frames (0x17), link statistics RX and TX (0x1C, 0x1D), MSP, device ping and info, parameter and command frames, baud negotiation, encoders for flight mode, GPS and attitude, time, loss detection, and any policy (what to do when frames stop, which stick source is in charge). The CRC function is not public.
+Subset RC frames (0x17), link statistics RX and TX (0x1C, 0x1D), MSP, device ping and info, parameter and command frames, baud negotiation, encoders for flight mode, attitude and other telemetry frames, time, loss detection, and any policy (what to do when frames stop, which stick source is in charge). The CRC function is not public.
 
 ## Tests
 
-`cargo test` runs the host tests. Property tests (`proptest`): the same frames and the same counters however the stream is chunked (whole, split at random points, one byte at a time); arbitrary bytes, several kB per case, never panic and the buffer never holds more than 64 bytes, with every byte accounted for; the packing round trip through a test-only packer; the CRC against an independent long-division reference and the standard check value 0xBC for "123456789". Exhaustive tests: a stray 0xC8 with a plausible length at every offset 1 to 63 before a real frame; every single-bit flip of a reference RC, link statistics, battery and other frame, with the exact outcome counts (no flip decodes to the original; with a zero trailer some flips of the length byte give a different valid frame, listed in the test); `raw_to_us` over all of `u16`, monotonic and within 1 of the integer model `(v - 172) * 1024 / 1639 + 988` on 172 to 1811. Negative controls: reference frames built with a wrong CRC polynomial are refused by the bit-flip harness. Hand-worked vectors cover the RC packing, link statistics and the battery frame. A differential test checks the RC and link statistics decoders against `uf-crsf` 0.7.0 (a dev-dependency pinned `=0.7.0`, `Cargo.lock` committed) on random payloads, and that `uf-crsf` parses our battery frame back to the same values and writes the same bytes.
+`cargo test` runs the host tests. Property tests (`proptest`): the same frames and the same counters however the stream is chunked (whole, split at random points, one byte at a time); arbitrary bytes, several kB per case, never panic and the buffer never holds more than 64 bytes, with every byte accounted for; the packing round trip through a test-only packer; the CRC against an independent long-division reference and the standard check value 0xBC for "123456789". Exhaustive tests: a stray 0xC8 with a plausible length at every offset 1 to 63 before a real frame; every single-bit flip of a reference RC, link statistics, battery and other frame, with the exact outcome counts (no flip decodes to the original; with a zero trailer some flips of the length byte give a different valid frame, listed in the test); `raw_to_us` over all of `u16`, monotonic and within 1 of the integer model `(v - 172) * 1024 / 1639 + 988` on 172 to 1811. Negative controls: reference frames built with a wrong CRC polynomial are refused by the bit-flip harness. Hand-worked vectors cover the RC packing, link statistics, the battery frame and the GPS frame (made-up coordinates, with the altitude limits and errors). A differential test checks the RC and link statistics decoders against `uf-crsf` 0.7.0 (a dev-dependency pinned `=0.7.0`, `Cargo.lock` committed) on random payloads, and that `uf-crsf` parses our battery frame back to the same values and writes the same bytes, and the same for the GPS frame.
 
 ## Licence
 
